@@ -10,7 +10,8 @@
 ;    - sparks fly, a flare runs round the ring and bursts at the tip, ring stars twinkle, the engine
 ;      flames flicker, "DESIGNED AND CREATED BY / PROJECT MOON PI" fades in (C64 character set, hires);
 ;    - an old-TV switch-off ends it (each line flipped to an invalid VIC mode, which shows black).
-;  The SID plays a gliding chord, then a bell strike and a drum on the starburst.
+;  The SID plays a gliding chord (lead, echo voice, pulse bass), then a bell strike with echoes and a
+;  drum on the starburst.
 ;  Any key or fire button skips it. At the end the machine resets to BASIC.
 ;
 ;  This file assembles to build/main.bin (loads at $0800). tools/pack.py packs it together with
@@ -92,7 +93,7 @@ app_y6  = $70           ; sprite 6/7 state as last written to the VIC (for the F
 app_y7  = $71
 app_en  = $72
 app_ye  = $73
-n6lo    = $74           ; FLI lines each sprite covers (lo..hi-1), now and last time
+n6lo    = $74           ; FLI lines each sprite covers (lo..hi-1), now and last time: 8 bytes in a row
 n6hi    = $75
 n7lo    = $76
 n7hi    = $77
@@ -106,19 +107,15 @@ maxf    = $8c           ; 16-bit (debug)
 dcnt    = $8e
 dmax    = $8f
 dmaxf   = $90           ; 16-bit
-CFG     = $8b00         ; per FLI line: which of sprites 6/7 are there
-cfg     = CFG
-qa      = $83
-qb      = $84
-qc      = $85
-qd      = $86
-qbit    = $87
-qmask   = $88
 q1      = $7c           ; interrupt-only scratch (spfix runs inside the FLI interrupt)
+sst     = $7f
+skey    = $80
+stag    = $81
+EV      = $8b00         ; spfix: the 8 sorted edges, their sst bits, and the delay-change table
+ET      = $8b08
+DVT     = $8b10
 q2      = $7d
 qsi     = $7e
-qcnt    = $7f
-qptr    = $80           ; 16-bit
 
 sh_x    = $40           ; shadow VIC registers, copied in the bottom interrupt when dirty
 sh_y    = $48
@@ -215,12 +212,23 @@ start   sei
         inx
         bne -
 
-        ldx #FLI_LINES-1                ; no sprites on any FLI line yet
-        lda #0
--       sta CFG,x
+        ldx #15                         ; DVT[sst]: the new delay, or $80 when it is unchanged
+-       txa
+        and #3
+        tay
+        lda ktab,y
+        sta q1
+        txa
+        lsr
+        lsr
+        tay
+        lda ktab,y
+        cmp q1
+        bne +
+        lda #$80
++       sta DVT,x
         dex
-        cpx #$ff
-        bne -
+        bpl -
         ldx #NST-1                      ; stars
 -       lda s_dhi,x
         sta st_dhi,x
@@ -561,6 +569,20 @@ fli_lines
         lda #$3b
         sta $d011
         jsr ftasks                      ; the frame's work, with time to spare before line 46
+!if DBG = 2 {                           ; trace frames 256-447: finishing line $0334+, patch count $0200+
+        ldy frame+1
+        cpy #1
+        bne +
+        ldx frame
+        cpx #$c0
+        bcs +
+        lda $d012
+        sta $0334,x
+        lda dcnt
+        sta $0200,x
+        ldx #0
++
+}
 !if DBG {
         lda $d012                       ; how far into the next frame did that run?
         cmp #128
@@ -588,10 +610,11 @@ dl_hi   !byte >spare
         !for y, 1, FLI_LINES-1 { !byte >(fli_lines + (y-1)*LL + 8) }
 spare   !byte 0
 ktab    !byte 0, K6, K7, K67            ; delay patch for: no sprite, sprite 6, sprite 7, both
+etag    !byte 4, 4, 8, 8, 1, 1, 2, 2    ; sst bit each edge flips (n6lo n6hi n7lo n7hi o6lo o6hi o7lo o7hi)
 
 ; ---- spfix: keep the FLI delays right for the lines sprites 6 and 7 cover ------------------
-;  cfg (one byte per FLI line) holds bit 0 = sprite 6 there, bit 1 = sprite 7 there. Only lines a
-;  sprite has entered or left since last frame get their delay byte rewritten (usually a handful).
+;  Each sprite's FLI lines now (n) and last frame (o) are known, so only lines whose delay value
+;  changed get rewritten.
 spfix
 !if DBG {
         lda #0
@@ -645,29 +668,80 @@ spfix2
         lda q2
         sta n7hi
 
-        lda #1                          ; sprite 6: old o6 -> new n6
-        sta qbit
-        lda o6lo
-        sta qa
-        lda o6hi
-        sta qb
-        lda n6lo
-        sta qc
-        lda n6hi
-        sta qd
-        jsr moved
-        lda #2                          ; sprite 7
-        sta qbit
-        lda o7lo
-        sta qa
-        lda o7hi
-        sta qb
-        lda n7lo
-        sta qc
-        lda n7hi
-        sta qd
-        jsr moved
-        lda n6lo
+        ; The 8 range edges (old and new, both sprites) split the FLI lines into segments where
+        ; nothing changes line to line. Sort the edges, then sweep them: each edge flips one bit of
+        ; sst (1 = sprite 6 was there, 2 = sprite 7 was, 4 = sprite 6 is, 8 = sprite 7 is), and
+        ; DVT[sst] says whether the segment's delay changed (and to what). Changed lines are
+        ; rewritten once each, about 27 cycles a line.
+        ldx #7
+-       lda n6lo,x
+        sta EV,x
+        lda etag,x
+        sta ET,x
+        dex
+        bpl -
+        ldx #1                          ; insertion sort, 8 edges
+.ins    lda EV,x
+        sta skey
+        lda ET,x
+        sta stag
+        txa
+        tay
+-       lda EV-1,y
+        cmp skey
+        bcc +
+        beq +
+        sta EV,y
+        lda ET-1,y
+        sta ET,y
+        dey
+        bne -
++       lda skey
+        sta EV,y
+        lda stag
+        sta ET,y
+        inx
+        cpx #8
+        bne .ins
+        lda #0
+        sta sst
+        ldx #0
+.edge   lda EV,x
+        cmp #FLI_LINES
+        bcs .sdone
+        sta q1
+        lda sst
+        eor ET,x
+        sta sst
+        cpx #7
+        beq .sdone
+        lda EV+1,x                      ; segment [q1, q2)
+        cmp #FLI_LINES
+        bcc +
+        lda #FLI_LINES
++       sta q2
+        cmp q1
+        beq .enext                      ; empty
+        ldy sst
+        lda DVT,y
+        bmi .enext                      ; same delay as before: nothing to write
+        stx qsi
+        ldy q1
+-       ldx dl_lo,y
+        stx .sp+1
+        ldx dl_hi,y
+        stx .sp+2
+.sp     sta $ffff
+!if DBG {
+        inc dcnt
+}
+        iny
+        cpy q2
+        bcc -
+        ldx qsi
+.enext  inx
+        jmp .edge
+.sdone  lda n6lo                        ; now becomes last time
         sta o6lo
         lda n6hi
         sta o6hi
@@ -676,87 +750,6 @@ spfix2
         lda n7hi
         sta o7hi
         rts
-
-;  one sprite went from lines [qa,qb) to [qc,qd): lines it left lose qbit, lines it entered gain it
-moved   lda qa                          ; left: [qa, min(qb,qc)) and [max(qa,qd), qb)
-        sta q1
-        lda qb
-        cmp qc
-        bcc +
-        lda qc
-+       sta q2
-        jsr clrbit
-        lda qa
-        cmp qd
-        bcs +
-        lda qd
-+       sta q1
-        lda qb
-        sta q2
-        jsr clrbit
-        lda qc                          ; entered: [qc, min(qd,qa)) and [max(qc,qb), qd)
-        sta q1
-        lda qd
-        cmp qa
-        bcc +
-        lda qa
-+       sta q2
-        jsr setbit
-        lda qc
-        cmp qb
-        bcs +
-        lda qb
-+       sta q1
-        lda qd
-        sta q2
-        jmp setbit
-
-clrbit  lda qbit                        ; lines q1..q2-1: cfg &= ~qbit, rewrite their delay byte
-        eor #$ff
-        sta qmask
-        ldy q1
-        cpy q2
-        bcs +
--       lda cfg,y
-        and qmask
-        sta cfg,y
-        tax
-        lda dl_lo,y
-        sta qptr
-        lda dl_hi,y
-        sta qptr+1
-        lda ktab,x
-        ldx #0
-        sta (qptr,x)
-!if DBG {
-        inc dcnt
-}
-        iny
-        cpy q2
-        bcc -
-+       rts
-
-setbit  ldy q1                          ; lines q1..q2-1: cfg |= qbit, rewrite their delay byte
-        cpy q2
-        bcs +
--       lda cfg,y
-        ora qbit
-        sta cfg,y
-        tax
-        lda dl_lo,y
-        sta qptr
-        lda dl_hi,y
-        sta qptr+1
-        lda ktab,x
-        ldx #0
-        sta (qptr,x)
-!if DBG {
-        inc dcnt
-}
-        iny
-        cpy q2
-        bcc -
-+       rts
 
 range   ; A = sprite Y register, X = height -> q1..q2-1 = FLI lines it covers (255/0 if none)
         sec

@@ -21,8 +21,13 @@ The intro runs for about 8½ seconds:
 5. **Credits.** **DESIGNED AND CREATED BY / PROJECT MOON PI** fades in, drawn in the C64's own character set.
 6. **Switch-off.** An old-TV switch-off closes the picture to a line, then the machine resets to BASIC.
 
-The SID plays a filtered string-and-brass chord gliding from C7 down to C3 as the badge flies in. Then comes one
-bell-like strike and a drum as the starburst fires.
+The SID plays on all three voices as the badge flies in. A filtered sawtooth lead glides from C7 down to C3. A
+second voice repeats it 0.15 s later, slightly quieter and 5 cents sharp, as an echo. A pulse-wave bass, two
+octaves down with a slowly sweeping pulse width, swells in underneath and ends on a low C1. As the starburst
+fires, a bell strikes over a drum, and the bell echoes three times, each repeat softer.
+
+The bell's echoes use a trick, because the SID has no volume setting per voice. Each repeat starts a slow attack,
+then closes the gate one frame later. The note only climbs to about 45%, 25% or 15% of full before it rings away.
 
 Any key or the joystick fire button skips the intro.
 
@@ -76,10 +81,12 @@ bank.
 colours. On lines where sprites are showing, the VIC takes some extra cycles for the sprite data, which would
 make the write late and smear garbage across the left of the badge.
 
-So each line's wait is a `BNE` into a small slide of instructions, and one byte sets how long it waits. A table
-records which of the flare sprites (6 and 7) covers each line. Each frame, only the lines a sprite entered or
-left get their byte rewritten. This runs at the end of the FLI interrupt, right after the sprite registers
-change, so the picture and the patch always match.
+So each line's wait is a `BNE` into a small slide of instructions, and one byte sets how long it waits. Each
+frame, the top and bottom lines of the two flare sprites (6 and 7), old and new, give 8 edges. These are sorted,
+then swept. Between two edges nothing changes, so a stretch of lines is rewritten only if its delay value
+changed, at about 27 cycles a line. This runs at the end of the FLI interrupt, right after the sprite registers
+change, so the picture and the patch always match. The worst frame finishes on raster line 35 of the next frame;
+the deadline is line 46.
 
 The delays were measured with VICE monitor breakpoints on each line's `STA $D011` (`CAL=1` parks the sprites):
 
@@ -94,7 +101,9 @@ everything below it.
 
 **Debugging builds.**
 - `ACMEDEFS=-DDBG=1 ./build.sh` turns the border red (or yellow) for good if the FLI interrupt ever starts late,
-  and records the worst finishing line.
+  and records the worst finishing line ($3E) and its frame ($8C).
+- `ACMEDEFS=-DDBG=2 ./build.sh` also logs frames 256–447: the finishing line at $0334 and the number of
+  patched lines at $0200.
 - `ACMEDEFS="-DCAL=1 -DK6=.. -DK7=.. -DK67=.."` is the calibration build.
 - Test runs use `+saveres`, so VICE never saves test settings into your own configuration.
 

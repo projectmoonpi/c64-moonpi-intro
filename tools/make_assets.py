@@ -404,24 +404,35 @@ def make_music():
 
     s0, s1 = F(0.2), FACE
     HOLD, STRIKE = FACE + F(1.2), FX + F(2.1)
+    ECHO = F(0.15)                           # voice 2 repeats voice 1 this much later
+    BASS_ON = s0 + F(1.0)                    # voice 3 swells in under the chord
+
+    def lead(f):                             # the glide: C7 down to C3, with a little vibrato
+        t = f / FPS
+        u = max(0.0, min(1.0, (f - s0) / (s1 - s0)))
+        base = hz(96) * (hz(48) / hz(96)) ** u
+        return base * 2 ** (6 * math.sin(2 * math.pi * 5.2 * t) / 1200), base, u
+
     w(0, 0x18, 0x1F)                         # low-pass on, volume 15
-    w(0, 0x17, 0x43)                         # resonance 4, filter voices 1 and 2
-    for v, (ad, sr) in enumerate(((0xC0, 0xF9), (0xD0, 0xF9), (0xC0, 0xFA))):
+    w(0, 0x17, 0x43)                         # resonance 4, filter voices 1 and 2; the bass stays unfiltered
+    # voice 1 lead (full), voice 2 echo (sustains lower, so it sits behind), voice 3 bass (slow swell)
+    for v, (ad, sr) in enumerate(((0xC0, 0xF9), (0xD0, 0x99), (0xC0, 0xBA))):
         w(0, v * 7 + 5, ad); w(0, v * 7 + 6, sr)
     last = None
-    for f in range(s0, HOLD + 1):            # the glide: C7 down to C3, with a little vibrato
-        t = f / FPS
-        u = min(1.0, (f - s0) / (s1 - s0))
-        base = hz(96) * (hz(48) / hz(96)) ** u
-        vib = 2 ** (6 * math.sin(2 * math.pi * 5.2 * t) / 1200)
-        freq(f, 0, base * vib)
-        freq(f, 1, base * 0.5 * 2 ** (7 / 1200) * vib)
-        freq(f, 2, base * 0.25)
-        cut = int(round(0x98 * (0x2C / 0x98) ** u))   # darker as it falls
-        if cut != last:
-            w(f, 0x16, cut); last = cut
-    w(s0, 4, 0x21); w(s0, 11, 0x21); w(s0, 18, 0x11)         # gates on: saw, saw, triangle
-    w(HOLD, 4, 0x20); w(HOLD, 11, 0x20); w(HOLD, 18, 0x10)   # gates off: release
+    for f in range(s0, HOLD + ECHO + 1):
+        if f <= HOLD:
+            h, base, u = lead(f)
+            freq(f, 0, h)
+            cut = int(round(0x98 * (0x2C / 0x98) ** u))   # darker as it falls
+            if cut != last:
+                w(f, 0x16, cut); last = cut
+            freq(f, 2, base * 0.25)                         # two octaves down: ends on C1
+            pw = int(0x600 + 0x280 * math.sin(2 * math.pi * 0.6 * f / FPS))   # slow pulse-width sweep
+            w(f, 16, pw & 0xFF); w(f, 17, pw >> 8)
+        if f >= s0 + ECHO:
+            freq(f, 1, lead(f - ECHO)[0] * 2 ** (5 / 1200))     # the echo, 5 cents sharp
+    w(s0, 4, 0x21); w(s0 + ECHO, 11, 0x21); w(BASS_ON, 18, 0x41)       # gates on: saw, saw, pulse
+    w(HOLD, 4, 0x20); w(HOLD + ECHO, 11, 0x20); w(HOLD, 18, 0x40)      # gates off: release
     # one triangle strike (bell-like, two partials) and one drum, as the sparkle reaches the tip
     w(STRIKE - 2, 0x17, 0x00); w(STRIKE - 2, 0x18, 0x0F)
     for v, (ad, sr) in enumerate(((0x0C, 0x00), (0x0A, 0x00), (0x09, 0x00))):
@@ -431,6 +442,13 @@ def make_music():
         u = (f - STRIKE) / F(0.9)
         freq(f, 1, hz(36) * (hz(29) / hz(36)) ** u)
     w(STRIKE, 4, 0x11); w(STRIKE, 11, 0x11); w(STRIKE, 18, 0x11)
+    # the bell's echoes on voice 3: each is a slow attack cut off after one frame, so it only
+    # climbs part way (about 45%, 25%, 15%) before it rings away
+    for k, atk in enumerate((4, 6, 8)):
+        f = STRIKE + F(0.28) * (k + 1)
+        w(f, 18, 0x10); w(f, 19, atk << 4); w(f, 20, 0x0A)
+        freq(f, 2, 1320 * 2 ** (3 / 1200))
+        w(f + 1, 18, 0x11); w(f + 2, 18, 0x10)
     stream = bytearray()
     regs = {}
     for f in range(0, max(ev) + 1):
@@ -535,15 +553,19 @@ def main():
     table("twk_ph", [rng.randrange(64) for _ in twk_cells], out)
     table("flm_lo", [c & 255 for c in flame_cells], out); table("flm_hi", [0xD8 + (c >> 8) for c in flame_cells], out)
     table("line1_txt", screen_codes(LINE1), out); table("title_txt", screen_codes(TITLE), out)
+    # the credit-cell and switch-off tables go in the CPU-only page $8b20-$8bff (spfix uses $8b00-$8b1f)
+    out += ["low_end", "    * = $8b20"]
     table("line1_cells", [c & 255 for c in line1_cells], out); table("line1_cellh", [0xC0 + (c >> 8) for c in line1_cells], out)
     table("title_cells", [c & 255 for c in title_cells], out); table("title_cellh", [0xC0 + (c >> 8) for c in title_cells], out)
     table("tvh", tv, out)
+    out += ['    !if * > $8c00 { !error "the $8b20 tables run past $8c00" }']
     # the rest goes above bank 2's screen, sprites and font ($8c00-$9fff: CPU-only RAM)
-    out += ["low_end", "    * = $8c00"]
+    # every 256-byte table starts on a page ($8c00-$92ff): indexed reads that cross a page cost a
+    # cycle each, and the starfield loop reads warp/rnd constantly
+    out += ["    * = $8c00"]
     sq = [n * n // 4 for n in range(512)]
     table("sqlo", [v & 255 for v in sq[:256]], out); table("sqhi", [v >> 8 for v in sq[:256]], out)
     table("sqlo2", [v & 255 for v in sq[256:]], out); table("sqhi2", [v >> 8 for v in sq[256:]], out)
-    table("music", music, out)
     warp = []
     for f in range(END + 1):
         t = f / FPS
@@ -551,6 +573,7 @@ def main():
         warp.append(round(wv * 32))
     table("warp_lo", warp[:256], out); table("warp_hi", warp[256:] + [warp[-1]] * (256 - len(warp[256:])), out)
     table("rnd", [rng.randrange(256) for _ in range(256)], out)
+    table("music", music, out)              # last: its size changes with the tune
 
     (BUILD / "assets.asm").write_text("\n".join(out) + "\n")
     print(f"coin frames {len(frames)}, ring-star cells {len(twk_cells)}, flame cells {len(flame_cells)}; "
