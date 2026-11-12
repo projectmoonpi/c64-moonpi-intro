@@ -361,7 +361,8 @@ def make_track():
             x, y = along(u)
             k = min(1, (t - 0.3) / 0.25) * (1 if t < 2.1 else 1 - (t - 2.1) / 0.25)
             core = 1 if k > 0.66 else 15 if k > 0.33 else 12
-            put(7, i, P_CORE, 24 + x - 12, 50 + y - 10, core)
+            if t > 0.3 + 2 / FPS:                       # the core 2 frames after the halo: spreads the FLI repatch
+                put(7, i, P_CORE, 24 + x - 12, 50 + y - 10, core)
             if t < 2.1:
                 put(6, i, P_HALO, 24 + x - 24, 50 + y - 21, 7 if k > 0.66 else 15 if k > 0.33 else 11, big=True)
         if 2.1 <= t < 3.0:                                     # starburst at the tip

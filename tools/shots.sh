@@ -5,7 +5,7 @@ cd "$(dirname "$0")/.."
 out=$1; shift
 tmp=$(mktemp -d)
 for c in "$@"; do
-  ( perl -e 'alarm 150; exec @ARGV' x64sc -ntsc -default -warp -sounddev dummy -autostartprgmode 1 \
+  ( perl -e 'alarm 150; exec @ARGV' x64sc -default +saveres -ntsc -warp -sounddev dummy -autostartprgmode 1 \
       -autostart build/moonpi-intro.prg -limitcycles "$c" -exitscreenshot "$tmp/$c.png" >/dev/null 2>&1 ) &
 done
 wait

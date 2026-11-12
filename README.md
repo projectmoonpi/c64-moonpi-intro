@@ -33,7 +33,11 @@ LOAD"MOON PI INTRO",8
 RUN
 ```
 
-The file is 23 KB, packed. It unpacks itself into nearly all 64 KB of RAM.
+The disk has two copies of the intro:
+- **MOON PI INTRO** is packed with Exomizer (17 KB, 70 blocks). This is the one to load.
+- **MOON PI INTRO LZ** uses our own packer and loader (23 KB, 94 blocks).
+
+Both unpack themselves into nearly all 64 KB of RAM, including under the I/O area.
 
 **Needs an NTSC C64 with the 6567R8 VIC chip (65 cycles a line)**, which covers nearly every NTSC C64. The very
 first NTSC machines (1982–83, 6567R56A, 64 cycles a line) will show the FLI picture scrambled.
@@ -52,6 +56,7 @@ On the Mac:
 | 6502 program (ACME) | `src/intro.asm` |
 | Packer: our own LZ format, with the C64 unpack simulated and checked on every build | `tools/pack.py` |
 | Loader: BASIC line, unpacker (runs from the cassette buffer), packed data | `src/loader.asm` |
+| Main disk file: Exomizer `sfx` of the same two pieces | `build.sh` |
 
 **Memory**
 
@@ -67,14 +72,31 @@ has to switch banks. After the landing, the flare and burst sprites live in the 
 bank.
 
 **FLI with moving sprites.** Each of the badge's 176 raster lines runs 16 bytes of code. The code writes $D018
-(which colour screen) and then $D011 at exactly cycle 15. That forces a bad line, so the VIC fetches a fresh
-line of colours. On lines where sprites are showing, the VIC takes 6–10 extra cycles for the sprite data, which
-would make the write late and smear garbage across the left of the badge.
+(which colour screen) and then $D011 on cycle 15. That forces a bad line, so the VIC fetches a fresh line of
+colours. On lines where sprites are showing, the VIC takes some extra cycles for the sprite data, which would
+make the write late and smear garbage across the left of the badge.
 
-So each line's wait is a `BNE` into a small slide of instructions, and a patch routine rewrites that one branch
-byte for the lines each sprite covers. It runs inside the FLI interrupt, once per frame, right after the sprite
-registers change. The patch values (2, 2, 3) were measured with the calibration build (`CAL=1`) in VICE x64sc:
-the largest values that never trigger the row restart.
+So each line's wait is a `BNE` into a small slide of instructions, and one byte sets how long it waits. A table
+records which of the flare sprites (6 and 7) covers each line. Each frame, only the lines a sprite entered or
+left get their byte rewritten. This runs at the end of the FLI interrupt, right after the sprite registers
+change, so the picture and the patch always match.
+
+The delays were measured with VICE monitor breakpoints on each line's `STA $D011` (`CAL=1` parks the sprites):
+
+| Sprites on the line | Extra cycles | Patch |
+|---|---|---|
+| sprite 6 | 5 | removes 4 |
+| both | 7 | removes 6 |
+| sprite 7 alone | 3 | none: the smallest step, 4, would restart the bitmap row |
+
+Rewriting the patch must never come too early. A write before cycle 15 restarts the bitmap row and scrambles
+everything below it.
+
+**Debugging builds.**
+- `ACMEDEFS=-DDBG=1 ./build.sh` turns the border red (or yellow) for good if the FLI interrupt ever starts late,
+  and records the worst finishing line.
+- `ACMEDEFS="-DCAL=1 -DK6=.. -DK7=.. -DK67=.."` is the calibration build.
+- Test runs use `+saveres`, so VICE never saves test settings into your own configuration.
 
 **The switch-off** sets bit 6 of $D011 line by line. Extended colour plus bitmap is an invalid VIC mode, which
 shows black.
@@ -90,5 +112,6 @@ shows black.
 - **Palette values.** The "colodore" C64 palette by Philip "Pepto" Timmermann.
 - **VIC-II timing reference.** "The MOS 6567/6569 video controller (VIC-II) and its application in the
   Commodore 64" by Christian Bauer.
-- The packer and loader are our own.
+- **Exomizer** 3.1.2 by Magnus Lind packs the main disk file. Its decruncher is included in that file
+  (Exomizer licence: free to use, as-is). The LZ packer and loader for the second file are our own.
 - Built with Claude Code (Anthropic).

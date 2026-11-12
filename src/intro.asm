@@ -100,6 +100,20 @@ o6lo    = $78
 o6hi    = $79
 o7lo    = $7a
 o7hi    = $7b
+late    = $3d
+maxrl   = $3e
+maxf    = $8c           ; 16-bit (debug)
+dcnt    = $8e
+dmax    = $8f
+dmaxf   = $90           ; 16-bit
+CFG     = $8b00         ; per FLI line: which of sprites 6/7 are there
+cfg     = CFG
+qa      = $83
+qb      = $84
+qc      = $85
+qd      = $86
+qbit    = $87
+qmask   = $88
 q1      = $7c           ; interrupt-only scratch (spfix runs inside the FLI interrupt)
 q2      = $7d
 qsi     = $7e
@@ -125,9 +139,10 @@ sh_bg   = $6a
 FLI_LINES = 176         ; FLI raster lines (character rows 0-21)
 LL      = 16            ; bytes of FLI code per line (16 lines a page)
 MID     = FLI_LINES / 2
-!ifndef K6 { K6 = 2 }    ; delay patches (see spfix), measured in VICE x64sc NTSC
-!ifndef K7 { K7 = 2 }
-!ifndef K67 { K67 = 3 }
+!ifndef K6 { K6 = 1 }    ; delay patches (see spfix): measured write cycles in VICE x64sc NTSC (tools/cal.sh)
+!ifndef K7 { K7 = 0 }    ; sprite 7 alone steals 3 cycles: the smallest step (4) is too much
+!ifndef K67 { K67 = 2 }
+!ifndef DBG { DBG = 0 }  ; 1: border turns red for good if the FLI interrupt ever starts late
 !ifndef CAL { CAL = 0 }  ; 1: calibration -- sprites 6/7 parked at fixed heights after the landing
 
         * = $0800
@@ -200,6 +215,12 @@ start   sei
         inx
         bne -
 
+        ldx #FLI_LINES-1                ; no sprites on any FLI line yet
+        lda #0
+-       sta CFG,x
+        dex
+        cpx #$ff
+        bne -
         ldx #NST-1                      ; stars
 -       lda s_dhi,x
         sta st_dhi,x
@@ -212,10 +233,11 @@ start   sei
         bpl -
 
         lda #0                          ; variables and shadows
-        ldx #$7f
+        ldx #$86
 -       sta $02,x
         dex
-        bpl -
+        cpx #$ff
+        bne -
         lda #$ff
         sta lastfid
         sta lastf
@@ -239,7 +261,9 @@ start   sei
         sta d016b
         lda #255
         sta o6lo
+        sta o6hi
         sta o7lo
+        sta o7hi
         lda #<music
         sta mus
         lda #>music
@@ -408,6 +432,12 @@ ftasks  lda dirty
         and #$7f
         sta $d011
         lda sh_bord
+!if DBG {
+        ldx late
+        beq +
+        txa
++
+}
         sta $d020
         lda sh_bg
         sta $d021
@@ -423,17 +453,12 @@ ftasks  lda dirty
         dex
         bpl -
         jmp .ptrok
-.fliptr ldx #7                          ; bank 3: the same pointers in all eight FLI screens
--       lda sh_ptr,x                    ; (only when they change: four screens sit under I/O)
-        cmp lastptr,x
-        bne +
-        dex
-        bpl -
-        jmp .patch
-+       lda #$34
-        sta $01
-        ldx #7
+.fliptr lda #$34                        ; bank 3: the same pointer in all eight FLI screens,
+        sta $01                         ; only for sprites whose pointer changed
+        ldx #7                          ; (four screens sit under the I/O area)
 -       lda sh_ptr,x
+        cmp lastptr,x
+        beq +
         sta lastptr,x
         sta FLI+$03f8,x
         sta FLI+$07f8,x
@@ -443,7 +468,7 @@ ftasks  lda dirty
         sta FLI+$17f8,x
         sta FLI+$1bf8,x
         sta FLI+$1ff8,x
-        dex
++       dex
         bpl -
         lda #$35
         sta $01
@@ -472,7 +497,27 @@ nmi     rti
 ;  line's own low three bits at cycle 15, so the VIC fetches a fresh line of colours (from the
 ;  screen $d018 just picked) without restarting the bitmap row. The CPU then waits out the
 ;  40-cycle fetch and comes back at cycle 55 -- every line resynchronises itself.
-irqa    lda sh_xs
+irqa
+!if DBG {
+        lda late
+        bne ++                          ; keep the first verdict
+        lda fli_on
+        bne +
+        lda #5                          ; green: FLI interrupt while FLI is off (misrouted)
+dbg_mis sta late
+        bne ++
++       lda $d012
+        cmp #49
+        bcc ++
+        ldx #2                          ; red: a few lines late
+        cmp #64
+        bcc +
+        ldx #7                          ; yellow: very late
++
+dbg_late stx late
+++
+}
+        lda sh_xs
         ora #$18                        ; multicolour for the badge
         sta $d016
         lda sh_xs
@@ -516,6 +561,19 @@ fli_lines
         lda #$3b
         sta $d011
         jsr ftasks                      ; the frame's work, with time to spare before line 46
+!if DBG {
+        lda $d012                       ; how far into the next frame did that run?
+        cmp #128
+        bcs +
+        cmp maxrl
+        bcc +
+        sta maxrl
+        lda frame
+        sta maxf
+        lda frame+1
+        sta maxf+1
++
+}
         lda #46
         sta $d012
         jmp irqout
@@ -531,10 +589,26 @@ dl_hi   !byte >spare
 spare   !byte 0
 ktab    !byte 0, K6, K7, K67            ; delay patch for: no sprite, sprite 6, sprite 7, both
 
-; ---- spfix: patch the FLI delays for the lines sprites 6 and 7 cover --------------------
-spfix   lda app_en                      ; sprite 6
-        and #$40
-        ldx #21
+; ---- spfix: keep the FLI delays right for the lines sprites 6 and 7 cover ------------------
+;  cfg (one byte per FLI line) holds bit 0 = sprite 6 there, bit 1 = sprite 7 there. Only lines a
+;  sprite has entered or left since last frame get their delay byte rewritten (usually a handful).
+spfix
+!if DBG {
+        lda #0
+        sta dcnt
+        jsr spfix2
+        lda dcnt
+        cmp dmax
+        bcc +
+        sta dmax
+        lda frame
+        sta dmaxf
+        lda frame+1
+        sta dmaxf+1
++       rts
+spfix2
+}
+        ldx #21                         ; sprite 6 now
         lda app_ye
         and #$40
         beq +
@@ -545,15 +619,14 @@ spfix   lda app_en                      ; sprite 6
         lda app_y6
         jsr range
         jmp ++
-+       lda #255
++       lda #255                        ; (none = 255,255)
         sta q1
-        lda #0
         sta q2
 ++      lda q1
         sta n6lo
         lda q2
         sta n6hi
-        ldx #21                         ; sprite 7
+        ldx #21                         ; sprite 7 now
         lda app_ye
         and #$80
         beq +
@@ -566,59 +639,35 @@ spfix   lda app_en                      ; sprite 6
         jmp ++
 +       lda #255
         sta q1
-        lda #0
         sta q2
 ++      lda q1
         sta n7lo
         lda q2
         sta n7hi
-        lda n6lo                        ; lines to look at: old and new together
-        cmp n7lo
-        bcc +
-        lda n7lo
-+       cmp o6lo
-        bcc +
+
+        lda #1                          ; sprite 6: old o6 -> new n6
+        sta qbit
         lda o6lo
-+       cmp o7lo
-        bcc +
-        lda o7lo
-+       sta qsi
-        lda n6hi
-        cmp n7hi
-        bcs +
-        lda n7hi
-+       cmp o6hi
-        bcs +
+        sta qa
         lda o6hi
-+       cmp o7hi
-        bcs +
+        sta qb
+        lda n6lo
+        sta qc
+        lda n6hi
+        sta qd
+        jsr moved
+        lda #2                          ; sprite 7
+        sta qbit
+        lda o7lo
+        sta qa
         lda o7hi
-+       sta qcnt
-.fl     ldy qsi
-        cpy qcnt
-        bcs .fdone
-        lda #0
-        cpy n6lo
-        bcc +
-        cpy n6hi
-        bcs +
-        ora #1
-+       cpy n7lo
-        bcc +
-        cpy n7hi
-        bcs +
-        ora #2
-+       tax
-        lda dl_lo,y
-        sta qptr
-        lda dl_hi,y
-        sta qptr+1
-        lda ktab,x
-        ldy #0
-        sta (qptr),y
-        inc qsi
-        jmp .fl
-.fdone  lda n6lo
+        sta qb
+        lda n7lo
+        sta qc
+        lda n7hi
+        sta qd
+        jsr moved
+        lda n6lo
         sta o6lo
         lda n6hi
         sta o6hi
@@ -627,6 +676,87 @@ spfix   lda app_en                      ; sprite 6
         lda n7hi
         sta o7hi
         rts
+
+;  one sprite went from lines [qa,qb) to [qc,qd): lines it left lose qbit, lines it entered gain it
+moved   lda qa                          ; left: [qa, min(qb,qc)) and [max(qa,qd), qb)
+        sta q1
+        lda qb
+        cmp qc
+        bcc +
+        lda qc
++       sta q2
+        jsr clrbit
+        lda qa
+        cmp qd
+        bcs +
+        lda qd
++       sta q1
+        lda qb
+        sta q2
+        jsr clrbit
+        lda qc                          ; entered: [qc, min(qd,qa)) and [max(qc,qb), qd)
+        sta q1
+        lda qd
+        cmp qa
+        bcc +
+        lda qa
++       sta q2
+        jsr setbit
+        lda qc
+        cmp qb
+        bcs +
+        lda qb
++       sta q1
+        lda qd
+        sta q2
+        jmp setbit
+
+clrbit  lda qbit                        ; lines q1..q2-1: cfg &= ~qbit, rewrite their delay byte
+        eor #$ff
+        sta qmask
+        ldy q1
+        cpy q2
+        bcs +
+-       lda cfg,y
+        and qmask
+        sta cfg,y
+        tax
+        lda dl_lo,y
+        sta qptr
+        lda dl_hi,y
+        sta qptr+1
+        lda ktab,x
+        ldx #0
+        sta (qptr,x)
+!if DBG {
+        inc dcnt
+}
+        iny
+        cpy q2
+        bcc -
++       rts
+
+setbit  ldy q1                          ; lines q1..q2-1: cfg |= qbit, rewrite their delay byte
+        cpy q2
+        bcs +
+-       lda cfg,y
+        ora qbit
+        sta cfg,y
+        tax
+        lda dl_lo,y
+        sta qptr
+        lda dl_hi,y
+        sta qptr+1
+        lda ktab,x
+        ldx #0
+        sta (qptr,x)
+!if DBG {
+        inc dcnt
+}
+        iny
+        cpy q2
+        bcc -
++       rts
 
 range   ; A = sprite Y register, X = height -> q1..q2-1 = FLI lines it covers (255/0 if none)
         sec
@@ -666,7 +796,6 @@ range   ; A = sprite Y register, X = height -> q1..q2-1 = FLI lines it covers (2
         rts
 .none   lda #255
         sta q1
-        lda #0
         sta q2
         rts
 
@@ -1163,14 +1292,46 @@ land    lda #0
         sta landed
         rts
 
-; ---- the credit lines, drawn from the C64's own character set ------------------------------
-text    lda #<LINE1_BMP                 ; line 1: normal size, half a character right
+; ---- the credit lines, drawn from the C64's own character set, a little per frame ----------
+textstep
+        lda drawn                       ; drawn = characters done: line 1 first, then the title
+        cmp #NLINE1+NTITLE
+        bcs .tsdone
+        cmp #NLINE1
+        bcs .title
+        jsr line1ch                     ; two of line 1 per frame
+        inc drawn
+        lda drawn
+        cmp #NLINE1
+        bcs .tsdone
+        jsr line1ch
+        inc drawn
+.tsdone rts
+.title  sec
+        sbc #NLINE1
+        jsr titlech                     ; two big ones per frame
+        inc drawn
+        lda drawn
+        cmp #NLINE1+NTITLE
+        bcs +
+        sec
+        sbc #NLINE1
+        jsr titlech
+        inc drawn
++       rts
+
+line1ch lda drawn                       ; character k of line 1: normal size, half a cell right
+        sta k
+        asl
+        asl
+        asl
+        clc
+        adc #<LINE1_BMP
         sta dst
         lda #>LINE1_BMP
+        adc #0
         sta dst+1
-        lda #0
-        sta k
-.t1     ldx k
+        ldx k
         lda line1_txt,x
         jsr glyph
         ldy #0
@@ -1200,23 +1361,20 @@ text    lda #<LINE1_BMP                 ; line 1: normal size, half a character 
         tay
         cpy #8
         bne -
-        lda dst
+        rts
+
+titlech sta k                           ; character k of the title: double size
+        asl
+        asl
+        asl
+        asl
         clc
-        adc #8
-        sta dst
-        bcc +
-        inc dst+1
-+       inc k
-        lda k
-        cmp #NLINE1
-        bne .t1
-        lda #<TITLE_BMP                 ; line 2: double size (each dot 2 x 2)
+        adc #<TITLE_BMP
         sta dst
         lda #>TITLE_BMP
+        adc #0
         sta dst+1
-        lda #0
-        sta k
-.t2     ldx k
+        ldx k
         lda title_txt,x
         jsr glyph
         ldy #0
@@ -1268,16 +1426,6 @@ text    lda #<LINE1_BMP                 ; line 1: normal size, half a character 
         iny
         cpy #8
         bne .tr
-        lda dst
-        clc
-        adc #16
-        sta dst
-        bcc +
-        inc dst+1
-+       inc k
-        lda k
-        cmp #NTITLE
-        bne .t2
         rts
 
 glyph   sta gl                          ; screen code -> FONT + code * 8
@@ -1390,7 +1538,11 @@ post    lda f                           ; idx = f - FACE (capped at 255)
         sta sh_col+7
 }
 
-.fx     lda f+1                         ; switch-off time?
+.fx     lda idx                         ; after the flash: draw a little of the credit text
+        cmp #FLASHLEN                   ; each frame (hidden until it fades in), so the
+        bcc +                           ; main loop never stalls
+        jsr textstep
++       lda f+1                         ; switch-off time?
         cmp #>OUT
         bcc .live
         bne +
@@ -1444,24 +1596,16 @@ post    lda f                           ; idx = f - FACE (capped at 255)
         dex
         bpl -
 
-.credit lda f                           ; line 1 fades in at CREDIT
+.credit lda drawn                       ; each line fades in only once it is fully drawn
+        cmp #NLINE1
+        bcc .cdone
+        lda f                           ; line 1 fades in at CREDIT
         sec
         sbc #<CREDIT
         tax
         lda f+1
         sbc #>CREDIT
         bcc .cdone
-        lda drawn                       ; draw the text the first time (hidden: colour 0)
-        bne +
-        inc drawn
-        jsr text
-        rts
-+       lda f
-        sec
-        sbc #<CREDIT
-        tax
-        lda f+1
-        sbc #>CREDIT
         beq +
         ldx #255
 +       txa
@@ -1474,6 +1618,9 @@ post    lda f                           ; idx = f - FACE (capped at 255)
 +       tax
         lda c1fade,x
         jsr line1c
+        lda drawn
+        cmp #NLINE1+NTITLE
+        bcc .cdone
         lda f                           ; line 2 at NAME
         sec
         sbc #<NAME
