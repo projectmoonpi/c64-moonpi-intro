@@ -1,0 +1,1343 @@
+; =============================================================================================
+;  Project Moon Pi -- animated logo intro for the Commodore 64 (NTSC)
+;  The website intro, rebuilt for the C64: a starfield streams out, the badge flies in flipping
+;  like a coin (sprites), lands with a flash and a jolt (bitmap), sparks fly, a flare runs round
+;  the ring and bursts at the tip, ring stars twinkle, the engine flames flicker, and
+;  "DESIGNED AND CREATED BY / PROJECT MOON PI" fades in. Sound on the SID.
+;  Any key or fire button skips it. It returns to BASIC when done (SYS 2061 from a loader works too).
+;
+;  Assemble with ACME:  acme -f cbm -o build/intro.prg src/intro.a   (see build.sh)
+;  Designed and Created by Project Moon Pi.
+; =============================================================================================
+
+!cpu 6510
+!to "build/intro.prg", cbm
+
+; ---- memory map (VIC bank 3, $c000-$ffff) ------------------------------------------------------
+SCR     = $c000         ; bitmap colours (screen RAM); sprite pointers at $c3f8
+SPRA    = $c400         ; coin sprites, buffer A (blocks 16-21)
+SPRB    = $c580         ; coin sprites, buffer B (blocks 22-27)
+SPRPOST = $c700         ; sparks, flare, halo, burst (blocks 28-36)
+FONT    = $ca00         ; copy of the character ROM's first 64 characters (512 bytes)
+BMP     = $e000         ; the bitmap (RAM under the KERNAL; we run with $01 = $35)
+COLRAM  = $d800
+ZPSAVE  = $cc00         ; zero page saved here and put back at the end
+
+; ---- zero page ---------------------------------------------------------------------------------
+frame   = $02           ; 16-bit, counted by the raster interrupt
+f       = $04           ; 16-bit, the frame the main loop is working on
+ma      = $06
+mb      = $07
+mlo     = $08
+mhi     = $09
+ptr     = $0a
+ptr2    = $0c
+t1      = $0e
+t2      = $0f
+si      = $10           ; star index
+r       = $11
+xs      = $12           ; 16-bit star x
+ys      = $14
+cell    = $15           ; 16-bit
+mus     = $17           ; 16-bit music pointer
+dirty   = $19
+logo_on = $1a
+buf     = $1b
+lastfid = $1c
+armed   = $1d
+rndi    = $1e
+landed  = $1f
+fades   = $20
+warp    = $21
+idx     = $22
+nx      = $23
+cnt     = $24
+col     = $25
+cx      = $26           ; 16-bit
+cy      = $28
+dxx     = $29
+dyy     = $2a
+msb     = $2b
+pbase   = $2c
+lastf   = $2d
+dst     = $2e           ; 16-bit
+gl      = $30           ; 16-bit glyph pointer
+k       = $32
+fcol    = $33
+
+; ---- shadow VIC registers (copied in the bottom-of-screen interrupt when dirty) ------------
+sh_x    = $40           ; 8
+sh_y    = $48           ; 8
+sh_ptr  = $50           ; 8
+sh_col  = $58           ; 8
+sh_msb  = $60
+sh_en   = $61
+sh_mc   = $62
+sh_xe   = $63
+sh_ye   = $64
+sh_mc0  = $65
+sh_mc1  = $66
+sh_d011 = $67
+sh_xs   = $68
+sh_bord = $69
+sh_bg   = $6a
+sh_split = $6b          ; 1 = hires credit rows on
+
+; ---- the star state lives here (RAM, not in the program image) -----------------------------
+st_dlo  = $cd00
+st_dhi  = $cd20
+st_ang  = $cd40
+st_oldl = $cd60
+st_oldh = $cd80
+st_oldm = $cda0
+
+        * = $0801
+        !word +, 2026
+        !byte $9e
+        !text "2061"
+        !byte 0
++       !word 0
+
+; =============================================================================================
+start   sei
+        ldx #2                          ; save the zero page (BASIC and the KERNAL want it back)
+-       lda $00,x
+        sta ZPSAVE,x
+        inx
+        bne -
+        lda #$7f                        ; no CIA interrupts
+        sta $dc0d
+        sta $dd0d
+        lda $dc0d
+        lda $dd0d
+        lda #0
+        sta $d01a
+        sta $d015
+        sta $d020
+        sta $d021
+        lda #$0b                        ; screen off while we set up
+        sta $d011
+
+        lda #$33                        ; character ROM in: copy the first 64 characters
+        sta $01
+        ldx #0
+-       lda $d000,x
+        sta FONT,x
+        lda $d100,x
+        sta FONT+$100,x
+        inx
+        bne -
+        lda #$35                        ; RAM at $a000/$e000, I/O on, from here on
+        sta $01
+        lda #<irq
+        sta $fffe
+        lda #>irq
+        sta $ffff
+        lda #<nmi
+        sta $fffa
+        lda #>nmi
+        sta $fffb
+
+        ldx #$18                        ; SID quiet
+        lda #0
+-       sta $d400,x
+        dex
+        bpl -
+
+        ; clear the bitmap ($e000-$ff3f)
+        lda #<BMP
+        sta ptr
+        lda #>BMP
+        sta ptr+1
+        ldx #31
+        ldy #0
+        tya
+-       sta (ptr),y
+        iny
+        bne -
+        inc ptr+1
+        dex
+        bne -
+        ldy #$3f
+-       sta $ff00,y
+        dey
+        bpl -
+
+        ; screen colours: rows 0-18 black, rows 19-24 light grey stars on black (hires),
+        ; credit-text cells black until they fade in; colour RAM black
+        lda #<SCR
+        sta ptr
+        lda #>SCR
+        sta ptr+1
+        lda #<mask
+        sta ptr2
+        lda #>mask
+        sta ptr2+1
+        ldx #4
+        ldy #0
+.isl    lda ptr+1                       ; cells 760 on ($c2f8 on) are the hires rows
+        cmp #>SCR+3
+        beq .ihi
+        cmp #>SCR+2
+        bne .iblk
+        cpy #$f8
+        bcc .iblk
+.ihi    lda (ptr2),y
+        cmp #2
+        beq .iblk
+        lda #$f0
+        bne .ist
+.iblk   lda #0
+.ist    sta (ptr),y
+        lda #0
+        sta COLRAM,y
+        sta COLRAM+$100,y
+        sta COLRAM+$200,y
+        sta COLRAM+$300,y
+        iny
+        bne .isl
+        inc ptr+1
+        inc ptr2+1
+        dex
+        bne .isl
+        ldx #0
+-       lda post_spr,x
+        sta SPRPOST,x
+        lda post_spr+$100,x
+        sta SPRPOST+$100,x
+        lda post_spr+$200,x             ; (a little past the end: harmless)
+        sta SPRPOST+$200,x
+        inx
+        bne -
+        ldx #NST-1
+-       lda s_dhi,x
+        sta st_dhi,x
+        lda s_ang,x
+        sta st_ang,x
+        lda #0
+        sta st_dlo,x
+        sta st_oldh,x
+        dex
+        bpl -
+
+        ; variables and shadow registers
+        lda #0
+        ldx #$6b-$02
+-       sta $02,x
+        dex
+        bpl -
+        lda #$ff
+        sta lastfid
+        sta lastf
+        lda #$3b                        ; bitmap, screen on, 25 rows
+        sta sh_d011
+        lda #6
+        sta sh_mc0
+        lda #14
+        sta sh_mc1
+        lda #1
+        sta sh_split
+        lda #<music
+        sta mus
+        lda #>music
+        sta mus+1
+
+        lda $dd00                       ; VIC bank 3
+        and #$fc
+        sta $dd00
+        lda #$08                        ; screen $c000, bitmap $e000
+        sta $d018
+        lda #$18
+        sta $d016
+        lda #251
+        sta $d012
+        lda #$3b
+        sta $d011
+        lda #1
+        sta $d01a
+        lda #$ff
+        sta $d019
+        lda #1
+        sta dirty
+        cli
+
+; =============================================================================================
+;  main loop: once per frame
+; =============================================================================================
+main    lda frame
+        cmp lastf
+        beq main
+        sta lastf
+        sta f
+        lda frame+1
+        sta f+1
+
+        jsr skipkey
+        bcc +
+        jmp finish
++       lda f+1                         ; the end?
+        cmp #>END
+        bcc +
+        bne ++
+        lda f
+        cmp #<END
+        bcc +
+++      jmp finish
+
++       ; warp for this frame
+        ldx f
+        lda f+1
+        bne +
+        lda warp_lo,x
+        jmp ++
++       lda warp_hi,x
+++      sta warp
+
+        ; stars, until the fade-out
+        lda f+1
+        cmp #>OUT
+        bcc +
+        bne ++
+        lda f
+        cmp #<OUT
+        bcs ++
++       jsr stars
+++
+        ; the coin flies until FACE, then the landing, then the light show
+        lda f+1
+        bne +
+        lda f
+        cmp #FACE
+        bcs +
+        jsr coin
+        jmp done
++       lda landed
+        bne +
+        jsr land
++       jsr post
+done    lda #1
+        sta dirty
+        jmp main
+
+; ---- any key or fire button skips (only after everything was let go once) -------------------
+skipkey lda #0
+        sta $dc00
+        lda $dc01
+        cmp #$ff
+        bne .down
+        lda #$ff
+        sta $dc00
+        lda $dc00
+        and #$10
+        beq .down
+        lda #1
+        sta armed
+        clc
+        rts
+.down   lda armed
+        beq +
+        sec
+        rts
++       clc
+        rts
+
+; =============================================================================================
+;  raster interrupts: line 198 switches to hires for the credit rows, line 251 back to
+;  multicolour, copies the shadow registers, plays the music and counts the frame
+; =============================================================================================
+irq     pha
+        txa
+        pha
+        tya
+        pha
+        lda #$ff
+        sta $d019
+        lda $d012
+        cmp #230
+        bcs .bottom
+        lda #203                        ; wait for the first line of the credit rows
+-       cmp $d012
+        bne -
+        lda sh_xs
+        ora #$08
+        ldx sh_split                    ; (multicolour all the way down during the flash)
+        bne +
+        ora #$10
++       sta $d016
+        lda #251
+        sta $d012
+        jmp .out
+.bottom lda sh_xs
+        ora #$18
+        sta $d016
+        lda dirty
+        beq .nocopy
+        ldx #7
+-       txa
+        asl
+        tay
+        lda sh_x,x
+        sta $d000,y
+        lda sh_y,x
+        sta $d001,y
+        lda sh_ptr,x
+        sta SCR+$3f8,x
+        lda sh_col,x
+        sta $d027,x
+        dex
+        bpl -
+        lda sh_msb
+        sta $d010
+        lda sh_mc
+        sta $d01c
+        lda sh_xe
+        sta $d01d
+        lda sh_ye
+        sta $d017
+        lda sh_mc0
+        sta $d025
+        lda sh_mc1
+        sta $d026
+        lda sh_en
+        sta $d015
+        lda sh_d011
+        and #$7f
+        sta $d011
+        lda sh_bord
+        sta $d020
+        lda sh_bg
+        sta $d021
+        lda #0
+        sta dirty
+.nocopy jsr playmus
+        inc frame
+        bne +
+        inc frame+1
++       lda #202                        ; the last line of the badge's rows
+        sta $d012
+.out    pla
+        tay
+        pla
+        tax
+        pla
+nmi     rti
+
+; ---- music: per frame a count, then that many (register, value) pairs; $ff ends it ---------
+playmus ldy #0
+        lda (mus),y
+        cmp #$ff
+        beq .mdone
+        tax
+        iny
+.ml     cpx #0
+        beq .mend
+        lda (mus),y
+        sta .mst+1
+        iny
+        lda (mus),y
+.mst    sta $d400
+        iny
+        dex
+        jmp .ml
+.mend   tya
+        clc
+        adc mus
+        sta mus
+        bcc .mdone
+        inc mus+1
+.mdone  rts
+
+; =============================================================================================
+;  multiply: A * Y -> mlo/mhi (unsigned, quarter squares)
+; =============================================================================================
+mul     sta ma
+        sty mb
+        clc
+        adc mb
+        tax
+        bcs .big
+        lda sqlo,x
+        sta mlo
+        lda sqhi,x
+        sta mhi
+        jmp .diff
+.big    lda sqlo2,x
+        sta mlo
+        lda sqhi2,x
+        sta mhi
+.diff   lda ma
+        sec
+        sbc mb
+        bcs +
+        eor #$ff
+        adc #1
++       tax
+        lda mlo
+        sec
+        sbc sqlo,x
+        sta mlo
+        lda mhi
+        sbc sqhi,x
+        sta mhi
+        rts
+
+; =============================================================================================
+;  the starfield: points streaming out from the badge's centre, plotted into the bitmap
+; =============================================================================================
+rj      jmp .resp                       ; (within branch reach of the star code)
+stars   lda #NST-1
+        sta si
+.sl     ldx si
+        lda s_spd,x                     ; d += speed * warp / 16
+        ldy warp
+        jsr mul
+        lda mhi
+        sta t1
+        lda mlo
+        lsr t1
+        ror
+        lsr t1
+        ror
+        lsr t1
+        ror
+        lsr t1
+        ror
+        ldx si
+        clc
+        adc st_dlo,x
+        sta st_dlo,x
+        lda st_dhi,x
+        adc t1
+        sta st_dhi,x
+        bcs rj
+        tay
+        lda rtab,y                      ; distance from the centre grows with d squared
+        cmp #$ff
+        beq rj
+        sta r
+        ldy st_ang,x                    ; x = 160 +- cos * r
+        lda cmag,y
+        ldy r
+        jsr mul
+        lda mlo
+        asl
+        lda mhi
+        rol
+        sta t1
+        ldx si
+        ldy st_ang,x
+        lda csgn,y
+        bne .xneg
+        lda #160
+        clc
+        adc t1
+        sta xs
+        lda #0
+        adc #0
+        sta xs+1
+        beq .xin
+        lda xs
+        cmp #64
+        bcs rj
+        jmp .xin
+rj2     jmp .resp
+.xneg   lda #160
+        sec
+        sbc t1
+        sta xs
+        bcc rj2
+        lda #0
+        sta xs+1
+.xin    ldx si                          ; y = CY +- sin * r * 0.75
+        ldy st_ang,x
+        lda smag,y
+        ldy r
+        jsr mul
+        lda mlo
+        asl
+        lda mhi
+        rol
+        sta t1
+        ldx si
+        ldy st_ang,x
+        lda ssgn,y
+        bne .yneg
+        lda #CY
+        clc
+        adc t1
+        bcs rj2
+        cmp #200
+        bcs rj2
+        sta ys
+        jmp .yin
+.yneg   lda #CY
+        sec
+        sbc t1
+        bcc rj2
+        sta ys
+.yin    jsr erase
+        ; which cell? (row * 40 + column)
+        lda ys
+        lsr
+        lsr
+        lsr
+        tay
+        lda xs+1
+        lsr
+        lda xs
+        ror
+        lsr
+        lsr
+        clc
+        adc row40lo,y
+        sta cell
+        lda row40hi,y
+        adc #0
+        sta cell+1
+        lda cell
+        clc
+        adc #<mask
+        sta ptr2
+        lda cell+1
+        adc #>mask
+        sta ptr2+1
+        ldy #0
+        lda (ptr2),y
+        beq .plot
+        cmp #2
+        beq .next
+        lda logo_on
+        bne .next
+.plot   ldy ys                          ; bitmap byte = row address + (x & $1f8)
+        lda xs
+        and #$f8
+        clc
+        adc bmplo,y
+        sta ptr
+        lda bmphi,y
+        adc xs+1
+        sta ptr+1
+        lda xs
+        lsr
+        and #3
+        tay
+        lda mcbits,y
+        ldx si
+        sta st_oldm,x
+        ldy #0
+        ora (ptr),y
+        sta (ptr),y
+        lda ptr
+        sta st_oldl,x
+        lda ptr+1
+        sta st_oldh,x
+        lda ys                          ; colour (multicolour rows only)
+        cmp #SPLITY
+        bcs .next
+        lda st_dhi,x
+        lsr
+        lsr
+        lsr
+        lsr
+        lsr
+        clc
+        adc s_bri,x
+        tay
+        lda f
+        clc
+        adc s_ph,x
+        and #$1c
+        beq +
+        lda lumtab,y
+        jmp ++
++       lda lumdim,y
+++      tax
+        lda cell
+        sta ptr
+        lda cell+1
+        clc
+        adc #>COLRAM
+        sta ptr+1
+        txa
+        ldy #0
+        sta (ptr),y
+.next   dec si
+        bmi +
+        jmp .sl
++       rts
+.resp   ldx si                          ; off the screen: start again near the middle
+        jsr erase
+        ldy rndi
+        lda rnd,y
+        and #63
+        sta st_ang,x
+        iny
+        lda rnd,y
+        and #31
+        ora #8
+        sta st_dhi,x
+        iny
+        sty rndi
+        lda #0
+        sta st_dlo,x
+        jmp .next
+
+erase   ldx si                          ; take the star's last dot away
+        lda st_oldh,x
+        beq +
+        sta ptr+1
+        lda st_oldl,x
+        sta ptr
+        lda st_oldm,x
+        eor #$ff
+        ldy #0
+        and (ptr),y
+        sta (ptr),y
+        lda #0
+        sta st_oldh,x
++       rts
+
+mcbits  !byte $c0,$30,$0c,$03
+lumtab  !byte 11,12,15,1,1,1,1,1,1
+lumdim  !byte 0,11,12,15,15,15,15,15,15
+
+; =============================================================================================
+;  the coin: sprite frames chosen per video frame, copied into the free buffer
+; =============================================================================================
+coin    lda f
+        cmp #APPEAR
+        bcs +
+        lda #0
+        sta sh_en
+        rts
++       sec
+        sbc #APPEAR
+        sta idx
+        tax
+        lda sch_fid,x
+        cmp lastfid
+        beq .place
+        sta lastfid
+        tax
+        lda coin_n,x
+        sta cnt
+        lda coin_src_lo,x
+        sta ptr
+        lda coin_src_hi,x
+        sta ptr+1
+        lda buf                         ; fill the buffer that isn't on screen
+        eor #1
+        sta buf
+        beq +
+        lda #<SPRB
+        sta ptr2
+        lda #>SPRB
+        sta ptr2+1
+        jmp .cp
++       lda #<SPRA
+        sta ptr2
+        lda #>SPRA
+        sta ptr2+1
+.cp     ldy #63
+-       lda (ptr),y
+        sta (ptr2),y
+        dey
+        bpl -
+        lda ptr
+        clc
+        adc #64
+        sta ptr
+        bcc +
+        inc ptr+1
++       lda ptr2
+        clc
+        adc #64
+        sta ptr2
+        bcc +
+        inc ptr2+1
++       dec cnt
+        bne .cp
+.place  ldx lastfid
+        lda coin_n,x
+        sta cnt
+        lda coin_nx,x
+        sta nx
+        lda coin_exp,x
+        sta sh_xe
+        sta sh_ye
+        lda coin_dx,x
+        sta dxx
+        lda coin_dy,x
+        sta dyy
+        lda coin_xlo,x
+        sta cx
+        lda coin_xhi,x
+        sta cx+1
+        ldx idx
+        lda sch_y,x
+        sta cy
+        lda sch_back,x                  ; the back is darker
+        beq +
+        lda #15
+        sta col
+        lda #6
+        sta sh_mc1
+        jmp ++
++       lda #1
+        sta col
+        lda #14
+        sta sh_mc1
+++      lda #6
+        sta sh_mc0
+        lda buf
+        beq +
+        lda #22
+        jmp ++
++       lda #16
+++      sta pbase
+        lda #0
+        sta msb
+        sta k                           ; column counter
+        lda cx
+        sta xs
+        lda cx+1
+        sta xs+1
+        ldx #0
+.pl     lda xs
+        sta sh_x,x
+        lda xs+1
+        beq +
+        lda bits,x
+        ora msb
+        sta msb
++       lda cy
+        sta sh_y,x
+        txa
+        clc
+        adc pbase
+        sta sh_ptr,x
+        lda col
+        sta sh_col,x
+        inc k
+        lda k
+        cmp nx
+        bne +
+        lda #0                          ; next row of sprites
+        sta k
+        lda cx
+        sta xs
+        lda cx+1
+        sta xs+1
+        lda cy
+        clc
+        adc dyy
+        sta cy
+        jmp ++
++       lda xs
+        clc
+        adc dxx
+        sta xs
+        bcc ++
+        inc xs+1
+++      inx
+        cpx cnt
+        bne .pl
+        lda msb
+        sta sh_msb
+        ldx cnt
+        lda entab,x
+        sta sh_en
+        lda #$ff
+        sta sh_mc
+        rts
+
+bits    !byte 1,2,4,8,16,32,64,128
+entab   !byte 0,1,3,7,15,31,63,127,255
+
+; =============================================================================================
+;  the landing: screen white, badge bitmap in, credit text drawn (hidden until it fades in)
+; =============================================================================================
+land    lda #0
+        sta sh_en
+        lda #$2b                        ; blank, white
+        sta sh_d011
+        lda #1
+        sta sh_bord
+        sta sh_bg
+        sta dirty
+-       lda dirty                       ; wait until that is on screen
+        bne -
+        lda #NST-1                      ; take every star off (the badge goes over them)
+        sta si
+-       jsr erase
+        dec si
+        bpl -
+        ; the badge: bitmap (24 pages), screen colours and colour RAM (3 pages each)
+        lda #<logo_bmp
+        sta ptr
+        lda #>logo_bmp
+        sta ptr+1
+        lda #<BMP
+        sta ptr2
+        lda #>BMP
+        sta ptr2+1
+        ldx #24
+        ldy #0
+-       lda (ptr),y
+        sta (ptr2),y
+        iny
+        bne -
+        inc ptr+1
+        inc ptr2+1
+        dex
+        bne -
+        ldx #0
+-       lda logo_scr,x
+        sta SCR,x
+        lda logo_scr+$100,x
+        sta SCR+$100,x
+        lda logo_scr+$200,x
+        sta SCR+$200,x
+        lda logo_col,x
+        sta COLRAM,x
+        lda logo_col+$100,x
+        sta COLRAM+$100,x
+        lda logo_col+$200,x
+        sta COLRAM+$200,x
+        inx
+        bne -
+        jsr text
+        lda #1
+        sta logo_on
+        sta landed
+        rts
+
+; ---- the credit lines, drawn from the C64's own character set ------------------------------
+text    ; line 1: normal size, half a character right (it is centred on a 4-pixel boundary)
+        lda #<LINE1_BMP
+        sta dst
+        lda #>LINE1_BMP
+        sta dst+1
+        lda #0
+        sta k
+.t1     ldx k
+        lda line1_txt,x
+        jsr glyph
+        ldy #0
+-       lda (gl),y
+        lsr
+        lsr
+        lsr
+        lsr
+        ora (dst),y
+        sta (dst),y
+        lda (gl),y
+        asl
+        asl
+        asl
+        asl
+        sta t1
+        tya
+        clc
+        adc #8
+        tay
+        lda t1
+        ora (dst),y
+        sta (dst),y
+        tya
+        sec
+        sbc #7
+        tay
+        cpy #8
+        bne -
+        lda dst
+        clc
+        adc #8
+        sta dst
+        bcc +
+        inc dst+1
++       inc k
+        lda k
+        cmp #NLINE1
+        bne .t1
+        ; line 2: double size (each dot 2 x 2)
+        lda #<TITLE_BMP
+        sta dst
+        lda #>TITLE_BMP
+        sta dst+1
+        lda #0
+        sta k
+.t2     ldx k
+        lda title_txt,x
+        jsr glyph
+        ldy #0                          ; glyph row
+.tr     sty t2
+        lda (gl),y
+        sta t1
+        ; which output byte: rows 0-3 go to the first character row, 4-7 to the next (+320)
+        tya
+        and #3
+        asl
+        sta r                           ; 0,2,4,6 = dot row inside the cell
+        lda dst
+        sta ptr
+        lda dst+1
+        sta ptr+1
+        cpy #4
+        bcc +
+        lda ptr
+        clc
+        adc #<320
+        sta ptr
+        lda ptr+1
+        adc #>320
+        sta ptr+1
++       lda t1                          ; left half -> left cell, two lines
+        lsr
+        lsr
+        lsr
+        lsr
+        tax
+        lda dbl,x
+        ldy r
+        sta (ptr),y
+        iny
+        sta (ptr),y
+        lda t1                          ; right half -> next cell
+        and #$0f
+        tax
+        lda dbl,x
+        pha
+        lda r
+        clc
+        adc #8
+        tay
+        pla
+        sta (ptr),y
+        iny
+        sta (ptr),y
+        ldy t2
+        iny
+        cpy #8
+        bne .tr
+        lda dst
+        clc
+        adc #16
+        sta dst
+        bcc +
+        inc dst+1
++       inc k
+        lda k
+        cmp #NTITLE
+        bne .t2
+        rts
+
+glyph   sta gl                          ; screen code -> FONT + code * 8
+        lda #0
+        sta gl+1
+        asl gl
+        rol gl+1
+        asl gl
+        rol gl+1
+        asl gl
+        rol gl+1
+        lda gl+1
+        clc
+        adc #>FONT
+        sta gl+1
+        rts
+
+dbl     !byte $00,$03,$0c,$0f,$30,$33,$3c,$3f,$c0,$c3,$cc,$cf,$f0,$f3,$fc,$ff
+
+; =============================================================================================
+;  after the landing: flash and jolt, sprite script, twinkles, flames, credit fade, fade out
+; =============================================================================================
+post    lda f                           ; idx = f - FACE (capped at 255)
+        sec
+        sbc #FACE
+        sta idx
+        lda f+1
+        sbc #0
+        beq +
+        lda #255
+        sta idx
++       lda idx
+        cmp #FLASHLEN
+        bcs +
+        tax
+        lda fl_d011,x
+        sta sh_d011
+        lda fl_xs,x
+        sta sh_xs
+        lda fl_col,x
+        sta sh_bord
+        sta sh_bg
+        lda #0
+        sta sh_split
+        jmp ++
++       lda #$3b
+        sta sh_d011
+        lda #1
+        sta sh_split
+        lda #0
+        sta sh_xs
+        sta sh_bord
+        sta sh_bg
+++      ; sprites
+        lda #0
+        sta sh_mc
+        lda idx
+        cmp #TRL
+        bcc +
+        lda #0
+        sta sh_en
+        jmp .fx
++       tay
+        !for s, 0, 7 {
+        lda tr_ptr + s*TRL, y
+        sta sh_ptr + s
+        lda tr_y + s*TRL, y
+        sta sh_y + s
+        lda tr_col + s*TRL, y
+        sta sh_col + s
+        lda tr_x + s*TRL, y
+        asl
+        sta sh_x + s
+        ror msb
+        }
+        lda msb
+        sta sh_msb
+        lda tr_en,y
+        sta sh_en
+        lda tr_xe,y
+        sta sh_xe
+        lda tr_ye,y
+        sta sh_ye
+
+.fx     ; is it fade-out time?
+        lda f+1
+        cmp #>OUT
+        bcc .live
+        bne .fade
+        lda f
+        cmp #<OUT
+        bcc .live
+.fade   lda f                           ; one darker step every 8 frames
+        sec
+        sbc #<OUT
+        lsr
+        lsr
+        lsr
+        clc
+        adc #1
+        cmp #6
+        bcc +
+        lda #6
++       sta t2
+-       lda fades
+        cmp t2
+        bcs +
+        jsr darker
+        inc fades
+        jmp -
++       rts
+
+.live   lda f+1                         ; light show running?
+        bne +
+        lda f
+        cmp #FX
+        bcc .credit
++       ldx #NTWK-1                     ; ring stars twinkle
+-       lda twk_lo,x
+        sta ptr
+        lda twk_hi,x
+        sta ptr+1
+        lda f
+        clc
+        adc twk_ph,x
+        lsr
+        and #31
+        tay
+        lda twkcol,y
+        ldy #0
+        sta (ptr),y
+        dex
+        bpl -
+        ldx #NFLAME-1                   ; engine flames flicker
+-       lda flm_lo,x
+        sta ptr
+        lda flm_hi,x
+        sta ptr+1
+        txa
+        asl
+        asl
+        asl
+        adc f
+        tay
+        lda rnd,y
+        and #7
+        tay
+        lda flmcol,y
+        ldy #0
+        sta (ptr),y
+        dex
+        bpl -
+
+.credit lda f                           ; line 1 fades in at CREDIT
+        sec
+        sbc #<CREDIT
+        tax
+        lda f+1
+        sbc #>CREDIT
+        bcc .cdone
+        beq +
+        ldx #255
++       txa
+        lsr
+        lsr
+        lsr
+        cmp #3
+        bcc +
+        lda #3
++       tax
+        lda c1fade,x
+        sta fcol
+        ldx #NLINE1C-1
+-       lda line1_cells,x
+        sta ptr
+        lda line1_cellh,x
+        sta ptr+1
+        lda fcol
+        ldy #0
+        sta (ptr),y
+        dex
+        bpl -
+        lda f                           ; line 2 at NAME
+        sec
+        sbc #<NAME
+        tax
+        lda f+1
+        sbc #>NAME
+        bcc .cdone
+        beq +
+        ldx #255
++       txa
+        lsr
+        lsr
+        lsr
+        cmp #3
+        bcc +
+        lda #3
++       tax
+        lda c2fade,x
+        sta fcol
+        ldx #NTITLEC-1
+-       lda title_cells,x
+        sta ptr
+        lda title_cellh,x
+        sta ptr+1
+        lda fcol
+        ldy #0
+        sta (ptr),y
+        dex
+        bpl -
+.cdone  rts
+
+twkcol  !byte 1,1,1,15,15,12,12,15,15,1,1,1,1,1,1,1, 1,1,15,12,11,12,15,1,1,1,1,1,1,1,1,1
+flmcol  !byte 1,3,14,1,15,3,1,13
+c1fade  !byte $00,$b0,$c0,$f0
+c2fade  !byte $00,$90,$80,$70
+
+; ---- one fade-out step: every colour in screen RAM and colour RAM one shade darker ---------
+darker  ldx #0
+-       ldy SCR,x
+        lda fadeb,y
+        sta SCR,x
+        ldy SCR+$100,x
+        lda fadeb,y
+        sta SCR+$100,x
+        ldy SCR+$200,x
+        lda fadeb,y
+        sta SCR+$200,x
+        lda COLRAM,x
+        and #$0f
+        tay
+        lda fadeb,y
+        sta COLRAM,x
+        lda COLRAM+$100,x
+        and #$0f
+        tay
+        lda fadeb,y
+        sta COLRAM+$100,x
+        lda COLRAM+$200,x
+        and #$0f
+        tay
+        lda fadeb,y
+        sta COLRAM+$200,x
+        inx
+        bne -
+        ldx #$e7                        ; and the last 232 cells
+-       ldy SCR+$300,x
+        lda fadeb,y
+        sta SCR+$300,x
+        lda COLRAM+$300,x
+        and #$0f
+        tay
+        lda fadeb,y
+        sta COLRAM+$300,x
+        dex
+        cpx #$ff
+        bne -
+        rts
+
+; =============================================================================================
+;  the end: put the machine back the way BASIC left it
+; =============================================================================================
+finish  sei
+        lda #0
+        sta $d01a
+        sta $d015
+        lda #$ff
+        sta $d019
+        ldx #$18
+        lda #0
+-       sta $d400,x
+        dex
+        bpl -
+        lda #$0b
+        sta $d011
+        lda $dd00
+        ora #3
+        sta $dd00
+        lda #$15
+        sta $d018
+        lda #$c8
+        sta $d016
+        lda #$7f
+        sta $dc00
+        lda #$37
+        sta $01
+        ldx #2
+-       lda ZPSAVE,x
+        sta $00,x
+        inx
+        bne -
+        lda #$81
+        sta $dc0d
+        lda #14
+        sta $d020
+        lda #6
+        sta $d021
+        lda #0
+        sta $c6                         ; empty the keyboard buffer
+        jsr $e544                       ; clear the screen
+        lda #$1b
+        sta $d011
+        cli
+        rts
+
+; =============================================================================================
+        !source "build/assets.a"
+prg_end
+        !if prg_end > $a000 { !error "program runs past $a000" }
+        !if SPRPOST + NPOST*64 > FONT { !error "sprites overlap the font copy" }
