@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Project Moon Pi C64 intro: turn the badge and the website intro's timeline into C64 data.
 
-Writes build/assets.a (ACME source: labels, constants and !byte tables) for src/intro.a, plus
-build/preview-logo.png, a picture of the converted bitmap.
+Writes build/assets.asm (ACME source: labels, constants and !byte tables) for src/intro.asm,
+build/fli.bin (the FLI picture: VIC bank 3, $c000-$ffbf) and build/preview-logo.png.
 
 Everything runs on NTSC frames (60 a second). Times come from the website's moonpi-intro.js and
 moonpi-splashfx.js, so the C64 version keeps the same rhythm.
@@ -26,21 +26,26 @@ APPEAR, FACE = F(0.35), F(3.3)          # badge appears / lands facing you
 FX = FACE + F(0.5)                      # badge light show starts
 CREDIT, NAME = F(4.3), F(4.7)           # credit lines fade in
 OUT, END = F(7.7), F(8.5)               # fade out, end
-LANDON = 8                              # frames of white blank at the landing (logo copied meanwhile)
+LANDON = 8                              # frames of white blank at the landing
 TRL = 212                               # frames of the after-landing sprite script
 
 # ---- screen layout ---------------------------------------------------------------------------
 # NTSC C64 pixels are about 0.75 as wide as they are tall, so a round badge is 4/3 wider in pixels.
-BADGE_H = 144                           # rows
-BADGE_W = 192                           # pixels (96 multicolour pixels, 24 cells)
-BADGE_X, BADGE_Y = 64, 4                # top-left on screen
+# The landed badge is an FLI picture in character rows 0-21 (176 lines); rows 22-24 are hires credits.
+FLI_ROWS = 22
+BADGE_H = 172                           # lines
+BADGE_W = 232                           # pixels (116 multicolour pixels)
+BADGE_X, BADGE_Y = 44, 2                # top-left on screen (FLI-bug columns 0-2 stay empty)
 CX, CY = 160, BADGE_Y + BADGE_H // 2    # badge centre (pixels)
-SPLIT_ROW = 19                          # rows 19-24 are hires (for the credit text)
-LINE1_ROW, TITLE_ROW = 20, 22
+SPLIT_ROW = FLI_ROWS
+LINE1_ROW, TITLE_ROW = 22, 23
 LINE1 = "DESIGNED AND CREATED BY"
 TITLE = "PROJECT MOON PI"
 SCALE_R = BADGE_H / 300                 # website design units -> rows (its coin is 300 across)
 SCALE_X = SCALE_R * 4 / 3               # -> pixels
+# sprite blocks for after the landing: the only free 64-byte holes in the FLI bank
+# ($x380 in screens 1-7, which hold rows 22-23 nobody displays, and $ff40/$ff80 after the bitmap)
+POST_BLOCKS = [30, 46, 62, 78, 94, 110, 126, 253, 254]
 
 # ---- C64 palette (colodore) --------------------------------------------------------------------
 PAL = np.array([
@@ -85,19 +90,17 @@ def to_screen(px, py):
 # =============================================================================================
 # 1. The landed badge: a multicolour bitmap (rows 0-18)
 # =============================================================================================
-def convert_logo():
-    MW, ROWS = 160, SPLIT_ROW * 8                    # multicolour pixels across, rows
+def convert_fli():
+    """The landed badge as FLI: per 4x8 cell one colour-RAM colour, per line two more, plus black."""
+    MW, ROWS = 160, FLI_ROWS * 8
     img = np.zeros((ROWS, MW, 3))
     rgb, _ = badge(BADGE_W // 2, BADGE_H)
     img[BADGE_Y:BADGE_Y + BADGE_H, BADGE_X // 2:BADGE_X // 2 + BADGE_W // 2] = rgb
-    img[BADGE_Y + BADGE_H:] = 0                      # nothing below the badge (the hires switch happens there)
 
-    def dist(px):                                    # px (..., 3) -> (..., 16) weighted squared distance
+    def dist(px):
         d = px[..., None, :] - PAL[None, :, :]
         return (d * d * W3).sum(-1)
 
-    # special cells: the ring stars (twinkle) and the engine flames (flicker) want their bright colour
-    # in the colour-RAM slot, so the program can recolour just that one
     twk, flame = set(), set()
     for x, y, _r in fx["stars"]:
         sx, sy = to_screen(x, y)
@@ -108,73 +111,69 @@ def convert_logo():
         for c in range(int(x0) // 8, int(x1) // 8 + 1):
             flame.add((r, c))
 
-    # pick each cell's three colours (plus black) for the smallest error
-    triples = list(combinations(range(1, 16), 3))
-    cellpal = {}
-    for r in range(SPLIT_ROW):
+    pairs = np.array(list(combinations(range(1, 16), 2)))          # 105 colour pairs for a line
+    c3 = np.zeros((FLI_ROWS, 40), dtype=int)                        # colour RAM per cell
+    lp = np.zeros((ROWS, 40, 2), dtype=int)                         # two colours per line per cell
+    used = set()
+    for r in range(FLI_ROWS):
         for c in range(40):
-            blk = img[r * 8:r * 8 + 8, c * 4:c * 4 + 4].reshape(-1, 3)
+            blk = img[r * 8:r * 8 + 8, c * 4:c * 4 + 4]            # 8 lines x 4 pixels
             if blk.max() < 8:
                 continue
-            d = dist(blk)                            # 32 x 16
-            best, bt = None, None
-            for t in triples:
-                e = np.minimum(d[:, 0], d[:, list(t)].min(1)).sum()
-                if best is None or e < best:
-                    best, bt = e, t
-            # drop colours no pixel uses
-            used = set(np.argmin(d[:, [0, *bt]], 1))
-            cellpal[(r, c)] = [col for i, col in enumerate(bt) if (i + 1) in used]
+            used.add((r, c))
+            d = dist(blk)                                            # 8 x 4 x 16
+            cands = range(16)
+            if (r, c) in twk or (r, c) in flame:
+                cands = [k for k in range(16) if LUM[k] > 150] + [0]
+            best = None
+            for k in cands:
+                base = np.minimum(d[..., 0], d[..., k])              # 8 x 4
+                e = np.minimum(base[None], np.minimum(d[..., pairs[:, 0]], d[..., pairs[:, 1]]).transpose(2, 0, 1))  # 105 x 8 x 4
+                per = e.sum(2)                                       # 105 x 8
+                tot = per.min(0).sum()
+                if best is None or tot < best[0]:
+                    best = (tot, k, per.argmin(0))
+            _, k, pi = best
+            c3[r, c] = k
+            lp[r * 8:r * 8 + 8, c] = pairs[pi]
 
-    # error-diffusion dither inside each cell's palette (gentle, so the edges stay clean)
     work = img.copy()
-    idx = np.zeros((ROWS, MW), dtype=int)            # chosen C64 colour per multicolour pixel
+    idx = np.zeros((ROWS, MW), dtype=int)
+    slot = np.zeros((ROWS, MW), dtype=int)
     for y in range(ROWS):
         for x in range(MW):
-            pal = [0] + cellpal.get((y // 8, x // 4), [])
+            c = x // 4
+            if (y // 8, c) not in used:
+                continue
+            pal = [0, int(lp[y, c, 0]), int(lp[y, c, 1]), int(c3[y // 8, c])]
             px = np.clip(work[y, x], 0, 255)
             d = ((PAL[pal] - px) ** 2 * W3).sum(1)
-            k = pal[int(np.argmin(d))]
-            idx[y, x] = k
-            err = (px - PAL[k]) * DITHER
+            s_ = int(np.argmin(d))
+            idx[y, x] = pal[s_]; slot[y, x] = s_
+            err = (px - PAL[pal[s_]]) * DITHER
             for dx, dy, wgt in ((1, 0, 7), (-1, 1, 3), (0, 1, 5), (1, 1, 1)):
                 xx, yy = x + dx, y + dy
                 if 0 <= xx < MW and yy < ROWS:
                     work[yy, xx] += err * wgt / 16
 
-    bmp = bytearray(SPLIT_ROW * 320)
-    scr = bytearray(SPLIT_ROW * 40)
-    col = bytearray(SPLIT_ROW * 40)
-    twk_cells, flame_cells = [], []
-    for r in range(SPLIT_ROW):
+    bank = bytearray(0x4000)                                         # $c000-$ffff as the VIC sees it
+    col = bytearray(FLI_ROWS * 40)
+    for r in range(FLI_ROWS):
         for c in range(40):
-            cols = sorted(set(idx[r * 8:r * 8 + 8, c * 4:c * 4 + 4].flatten()) - {0})
-            slot = {0: 0}
-            bright = max(cols, key=lambda k: LUM[k]) if cols else None
-            special = bright is not None and LUM[bright] > 150 and ((r, c) in twk or (r, c) in flame)
-            rest = list(cols)
-            if special:                                 # bright colour -> colour RAM (bits 11)
-                slot[bright] = 3; rest.remove(bright)
-                (twk_cells if (r, c) in twk else flame_cells).append(r * 40 + c)
-            for k, s in zip(rest, [1, 2, 3] if not special else [1, 2]):
-                slot[k] = s
-            hi = next((k for k, s in slot.items() if s == 1), 0)
-            lo = next((k for k, s in slot.items() if s == 2), 0)
-            cr = next((k for k, s in slot.items() if s == 3), 0)
-            scr[r * 40 + c] = hi << 4 | lo
-            col[r * 40 + c] = cr
+            col[r * 40 + c] = c3[r, c]
             for line in range(8):
+                y = r * 8 + line
+                bank[line * 0x400 + r * 40 + c] = lp[y, c, 0] << 4 | lp[y, c, 1] if (r, c) in used else 0
                 b = 0
                 for p in range(4):
-                    b = b << 2 | slot[idx[r * 8 + line, c * 4 + p]]
-                bmp[r * 320 + c * 8 + line] = b
+                    b = b << 2 | int(slot[y, c * 4 + p])
+                bank[0x2000 + r * 320 + c * 8 + line] = b
+    twk_cells = sorted(r * 40 + c for (r, c) in used if (r, c) in twk and LUM[c3[r, c]] > 150)
+    flame_cells = sorted(r * 40 + c for (r, c) in used if (r, c) in flame and LUM[c3[r, c]] > 150)
 
-    # a picture of the result, NTSC-shaped (each multicolour pixel 2 wide, rows 1.33 tall)
     prev = PAL[idx].astype(np.uint8)
     Image.fromarray(prev).resize((640, int(ROWS * 2 * 4 / 3)), Image.NEAREST).save(BUILD / "preview-logo.png")
-
-    mask_logo = {r * 40 + c for (r, c) in cellpal}
-    return bmp, scr, col, mask_logo, twk_cells, flame_cells
+    return bank, col, used, twk_cells, flame_cells
 
 
 # =============================================================================================
@@ -311,11 +310,10 @@ def glow(radius, rays=0, seed=1):
 
 def make_post_sprites():
     blocks = spark_frames() + [flare_core(), glow(7)] + [glow(r, 4) for r in (3, 5, 7, 9)]
-    return blocks          # block 28.. : sparks 28-30, core 31, halo 32, burst 33-36
+    return blocks          # sparks x3, core, halo, burst x4 -> POST_BLOCKS
 
 
-SPR_BASE = 28
-P_SPARK, P_CORE, P_HALO, P_BURST = 28, 31, 32, 33
+P_SPARK, P_CORE, P_HALO, P_BURST = 0, 3, 4, 5                       # indexes into POST_BLOCKS
 
 
 def path_points():
@@ -344,13 +342,13 @@ def make_track():
     sparks = [(math.radians(s * 60 + 20 + rng.uniform(-12, 12)), 260 + rng.uniform(0, 360)) for s in range(6)]
 
     def put(s, i, p, x, y, c, big=False):
-        ptr[s, i] = p; xh[s, i] = max(0, min(255, int(round(x / 2)))); yy[s, i] = max(0, min(255, int(round(y)))); cc[s, i] = c
+        ptr[s, i] = POST_BLOCKS[p]; xh[s, i] = max(0, min(255, int(round(x / 2)))); yy[s, i] = max(0, min(255, int(round(y)))); cc[s, i] = c
         en[i] |= 1 << s
         if big: xe[i] |= 1 << s; ye[i] |= 1 << s
 
     for i in range(TRL):
         land = (i - LANDON) / FPS
-        if 0 <= land < 1.8:                                   # sparks
+        if False and 0 <= land < 1.8:                         # sparks (now star dots: sprites upset the FLI timing)
             col = [1, 1, 15, 12, 11][min(4, int(land / 1.8 * 5))]
             k = min(2, int(land / 0.6))
             for s, (a, sp) in enumerate(sparks):
@@ -385,8 +383,7 @@ def make_flash():
         c = 1 if a > 0.55 else 15 if a > 0.35 else 12 if a > 0.18 else 11 if a > 0.04 else 0
         j = max(0, 1 - land / 0.45) * 9
         xs = int(round(max(0, min(7, j * SCALE_X * (1 + math.sin(land * 70)) / 2))))
-        ys = int(round(max(0, min(7, 3 + math.cos(land * 53) * j * SCALE_R))))
-        rows.append(((0x30 if j > 0 else 0x38) | ys, xs, c))   # 24 rows while it shakes (hides the idle lines)
+        rows.append((0x3B, xs, c))       # sideways only: FLI sets the vertical scroll on every line
     return rows
 
 
@@ -463,46 +460,51 @@ def screen_codes(s):
 
 
 def main():
-    bmp, scr, col, mask_logo, twk_cells, flame_cells = convert_logo()
+    bank, fli_col, used, twk_cells, flame_cells = convert_fli()
     frames, sched = make_coin()
     post = make_post_sprites()
     ptr, xh, yy, cc, en, xe, ye = make_track()
     flash = make_flash()
     music, strike = make_music()
-    assert strike == FX + F(2.1)
+    assert strike == FX + F(2.1) and len(post) == len(POST_BLOCKS)
 
-    # which cells stars may use: 0 free, 1 badge (after landing), 2 credit text (never)
+    # after the landing, stars keep out of: the badge, the FLI-bug columns, the credit text
     mask = bytearray(1000)
-    for c in mask_logo: mask[c] = 1
+    for (r, c) in used: mask[r * 40 + c] = 1
+    for r in range(FLI_ROWS):
+        for c in range(4): mask[r * 40 + c] = 1
     l1x = (320 - 8 * len(LINE1)) // 2
     line1_cells = list(range(LINE1_ROW * 40 + l1x // 8, LINE1_ROW * 40 + (l1x + 8 * len(LINE1) + 7) // 8))
     tx = (320 - 16 * len(TITLE)) // 2
     assert tx % 8 == 0 and l1x % 8 == 4
     title_cells = [r * 40 + c for r in (TITLE_ROW, TITLE_ROW + 1) for c in range(tx // 8, tx // 8 + 2 * len(TITLE))]
-    for c in line1_cells + title_cells: mask[c] = 2
-    init_scr = bytearray(0xF0 if (i >= SPLIT_ROW * 40 and mask[i] != 2) else 0 for i in range(1000))
-    # pad the logo to whole pages: bitmap 24 pages, screen/colour 3 pages (row 19's first cells stay blank/hires)
-    bmp += bytes(24 * 256 - len(bmp))
-    scr += bytes(init_scr[len(scr):768]); col += bytes(768 - len(col))
+    for c in line1_cells + title_cells: mask[c] = 1
+    # screen 0, rows 22-24 (hires): light grey for stars, black for the text until it fades in
+    for i in range(FLI_ROWS * 40, 1000):
+        bank[i] = 0 if i in line1_cells or i in title_cells else 0xF0
+    for blk, data in zip(POST_BLOCKS, post):
+        a0 = blk * 64
+        assert (a0 & 0x3FF) == 0x380 and a0 >= 0x400 or a0 >= 0x3F40, hex(a0)
+        bank[a0:a0 + 64] = data
+    (BUILD / "fli.bin").write_bytes(bytes(bank[:0x3FC0]))            # $c000-$ffbf
 
     rng = random.Random(11)
     NST = 32
     stars = [(rng.randrange(64), rng.randrange(0, 170), round((0.35 + rng.random() * 0.9) * 64),
               int(rng.random() > 0.5), rng.randrange(256)) for _ in range(NST)]
+    tv = [max(0, round(88 * (1 - (i / 36) ** 2))) if i <= 36 else 0 for i in range(END - OUT + 1)]
 
     out = ["; generated by tools/make_assets.py -- do not edit", ""]
     consts = dict(APPEAR=APPEAR, FACE=FACE, FX=FX, CREDIT=CREDIT, NAME=NAME, OUT=OUT, END=END, LANDON=LANDON,
                   TRL=TRL, NST=NST, NTWK=len(twk_cells), NFLAME=len(flame_cells), NCOIN=len(sched),
                   FLASHLEN=len(flash), CY=CY, SPLITY=SPLIT_ROW * 8, NLINE1=len(LINE1), NTITLE=len(TITLE),
                   LINE1_BMP=0xE000 + LINE1_ROW * 320 + (l1x // 8) * 8, TITLE_BMP=0xE000 + TITLE_ROW * 320 + tx,
-                  NLINE1C=len(line1_cells), NTITLEC=len(title_cells), SPR_BASE=SPR_BASE, NPOST=len(post))
+                  NLINE1C=len(line1_cells), NTITLEC=len(title_cells), TVLEN=len(tv))
     for k, v in consts.items():
         out.append(f"{k} = {v}")
     out.append("")
-    table("logo_bmp", bmp, out); table("logo_scr", scr, out); table("logo_col", col, out)
+    table("fli_col", fli_col, out)
     table("mask", mask, out)
-    table("post_spr", b"".join(post), out)
-    # coin frames
     blob = bytearray(); offs = []
     for fr in frames:
         offs.append(len(blob)); blob += fr["data"]
@@ -514,11 +516,9 @@ def main():
     table("coin_dx", [fr["dx"] for fr in frames], out); table("coin_dy", [fr["dy"] for fr in frames], out)
     table("coin_xlo", [fr["xbase"] & 0xFF for fr in frames], out); table("coin_xhi", [fr["xbase"] >> 8 for fr in frames], out)
     table("sch_fid", [s[0] for s in sched], out); table("sch_y", [s[1] for s in sched], out); table("sch_back", [s[2] for s in sched], out)
-    # after-landing sprite script (each table is 8 x TRL)
     table("tr_ptr", ptr.flatten(), out); table("tr_x", xh.flatten(), out); table("tr_y", yy.flatten(), out); table("tr_col", cc.flatten(), out)
     table("tr_en", en, out); table("tr_xe", xe, out); table("tr_ye", ye, out)
     table("fl_d011", [r[0] for r in flash], out); table("fl_xs", [r[1] for r in flash], out); table("fl_col", [r[2] for r in flash], out)
-    # stars
     table("s_ang", [s[0] for s in stars], out); table("s_dhi", [s[1] for s in stars], out)
     table("s_spd", [s[2] for s in stars], out); table("s_bri", [s[3] for s in stars], out); table("s_ph", [s[4] for s in stars], out)
     cm, cs, sm, ss = [], [], [], []
@@ -527,31 +527,33 @@ def main():
         cm.append(round(abs(c) * 127)); cs.append(int(c < 0)); sm.append(round(abs(s) * 127 * 0.75)); ss.append(int(s < 0))
     table("cmag", cm, out); table("csgn", cs, out); table("smag", sm, out); table("ssgn", ss, out)
     table("rtab", [(d * d >> 7) if (d * d >> 7) <= 254 else 255 for d in range(256)], out)
-    sq = [n * n // 4 for n in range(512)]
-    table("sqlo", [v & 255 for v in sq[:256]], out); table("sqhi", [v >> 8 for v in sq[:256]], out)
-    table("sqlo2", [v & 255 for v in sq[256:]], out); table("sqhi2", [v >> 8 for v in sq[256:]], out)
-    warp = []
-    for f in range(END + 1):
-        t = f / FPS
-        wv = 0.4 + 1.6 * min(1, t / 3.3) if t < 3.3 else max(0.15, 2 - (t - 3.3) * 1.2)
-        warp.append(round(wv * 32))
-    table("warp_lo", warp[:256], out); table("warp_hi", warp[256:] + [warp[-1]] * (256 - len(warp[256:])), out)
-    bl = [0xE000 + (y >> 3) * 320 + (y & 7) for y in range(200)]
+    bl = [(y >> 3) * 320 + (y & 7) for y in range(200)]               # + the bitmap's base
     table("bmplo", [v & 255 for v in bl], out); table("bmphi", [v >> 8 for v in bl], out)
     table("row40lo", [(r * 40) & 255 for r in range(25)], out); table("row40hi", [(r * 40) >> 8 for r in range(25)], out)
-    table("rnd", [rng.randrange(256) for _ in range(256)], out)
     table("twk_lo", [c & 255 for c in twk_cells], out); table("twk_hi", [0xD8 + (c >> 8) for c in twk_cells], out)
     table("twk_ph", [rng.randrange(64) for _ in twk_cells], out)
     table("flm_lo", [c & 255 for c in flame_cells], out); table("flm_hi", [0xD8 + (c >> 8) for c in flame_cells], out)
     table("line1_txt", screen_codes(LINE1), out); table("title_txt", screen_codes(TITLE), out)
     table("line1_cells", [c & 255 for c in line1_cells], out); table("line1_cellh", [0xC0 + (c >> 8) for c in line1_cells], out)
     table("title_cells", [c & 255 for c in title_cells], out); table("title_cellh", [0xC0 + (c >> 8) for c in title_cells], out)
-    table("fadeb", [DARKER[v >> 4] << 4 | DARKER[v & 15] for v in range(256)], out)
+    table("tvh", tv, out)
+    # the rest goes above bank 2's screen, sprites and font ($8c00-$9fff: CPU-only RAM)
+    out += ["low_end", "    * = $8c00"]
+    sq = [n * n // 4 for n in range(512)]
+    table("sqlo", [v & 255 for v in sq[:256]], out); table("sqhi", [v >> 8 for v in sq[:256]], out)
+    table("sqlo2", [v & 255 for v in sq[256:]], out); table("sqhi2", [v >> 8 for v in sq[256:]], out)
     table("music", music, out)
+    warp = []
+    for f in range(END + 1):
+        t = f / FPS
+        wv = 0.4 + 1.6 * min(1, t / 3.3) if t < 3.3 else max(0.15, 2 - (t - 3.3) * 1.2)
+        warp.append(round(wv * 32))
+    table("warp_lo", warp[:256], out); table("warp_hi", warp[256:] + [warp[-1]] * (256 - len(warp[256:])), out)
+    table("rnd", [rng.randrange(256) for _ in range(256)], out)
 
-    (BUILD / "assets.a").write_text("\n".join(out) + "\n")
-    sizes = dict(logo=len(bmp) + len(scr) + len(col), coin=len(blob), track=4 * 8 * TRL, music=len(music))
-    print(f"coin frames {len(frames)}, ring-star cells {len(twk_cells)}, flame cells {len(flame_cells)}; bytes {sizes}")
+    (BUILD / "assets.asm").write_text("\n".join(out) + "\n")
+    print(f"coin frames {len(frames)}, ring-star cells {len(twk_cells)}, flame cells {len(flame_cells)}; "
+          f"bytes coin {len(blob)}, track {4 * 8 * TRL}, music {len(music)}")
 
 
 if __name__ == "__main__":
