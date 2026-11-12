@@ -8,7 +8,7 @@ for v in "$@"; do
   set -- $v
   ACMEDEFS="-DCAL=1 -DK6=$1 -DK7=$2 -DK67=$3" ./build.sh >/dev/null 2>&1 || { echo "build failed for $v"; exit 1; }
   perl -e 'alarm 150; exec @ARGV' x64sc -default +saveres -ntsc -warp -sounddev dummy -autostartprgmode 1 \
-     -autostart build/moonpi-intro.prg -limitcycles ${CALCYC:-11600000} -exitscreenshot "$tmp/$1$2$3.png" >/dev/null 2>&1
+     -autostart build/moonpi-intro-lz.prg -limitcycles ${CALCYC:-11600000} -exitscreenshot "$tmp/$1$2$3.png" >/dev/null 2>&1
 done
 python3 - "$out" "$tmp" <<'P'
 import sys, glob, os

@@ -33,22 +33,39 @@ Any key or the joystick fire button skips the intro.
 
 ## Running it
 
+Download from the [latest release](https://github.com/projectmoonpi/c64-moonpi-intro/releases/latest):
+
+| File | What it is | Use it with |
+|---|---|---|
+| `moonpi-intro.d64` | Disk image with both versions | a real 1541 (written with a ZoomFloppy/XUM1541 and OpenCBM), an SD2IEC, a Pi1541, VICE |
+| `moonpi-intro.prg` | The intro on its own (Exomizer version) | a Kung Fu Flash or other SD cartridge, an SD2IEC, VICE |
+| `moonpi-intro.crt` | Cartridge image, Magic Desk type (32 KB) | a Kung Fu Flash, VICE, or burned to a Magic Desk-compatible EPROM cartridge |
+
+From disk:
+
 ```
 LOAD"MOON PI INTRO",8
 RUN
 ```
 
 The disk has two copies of the intro:
-- **MOON PI INTRO** is packed with Exomizer (17 KB, 70 blocks). This is the one to load.
-- **MOON PI INTRO LZ** uses our own packer and loader (23 KB, 94 blocks).
+- **MOON PI INTRO** is packed with Exomizer (18 KB, 73 blocks). This is the one to load.
+- **MOON PI INTRO LZ** uses our own packer and loader (24 KB, 97 blocks).
 
 Both unpack themselves into nearly all 64 KB of RAM, including under the I/O area.
+
+**The cartridge** starts the intro as soon as the C64 is switched on. Its boot code sets up the machine, copies
+the Exomizer program from the cartridge's banks into RAM, switches the cartridge off and runs it. The screen
+stays black for the 3 seconds it takes to unpack. With the cartridge off, the intro ends in BASIC as usual.
+Pressing the reset button turns the cartridge back on, so the intro plays again.
+
+To write the disk to a real 1541 with OpenCBM: `d64copy build/moonpi-intro.d64 8`.
 
 **Needs an NTSC C64 with the 6567R8 VIC chip (65 cycles a line)**, which covers nearly every NTSC C64. The very
 first NTSC machines (1982–83, 6567R56A, 64 cycles a line) will show the FLI picture scrambled.
 
 On the Mac:
-- `./build.sh` builds the intro.
+- `./build.sh` builds the intro: `build/moonpi-intro.d64`, `.prg` and `.crt`.
 - `./run.sh` runs it in VICE (NTSC C64, in a window).
 - `tools/shots.sh OUT.png CYCLES…` takes screenshots.
 - `tools/cal.sh` runs the FLI sprite-timing calibration.
@@ -62,6 +79,7 @@ On the Mac:
 | Packer: our own LZ format, with the C64 unpack simulated and checked on every build | `tools/pack.py` |
 | Loader: BASIC line, unpacker (runs from the cassette buffer), packed data | `src/loader.asm` |
 | Main disk file: Exomizer `sfx` of the same two pieces | `build.sh` |
+| Cartridge: boot code, and the CRT file builder | `src/cart.asm`, `tools/make_crt.py` |
 
 **Memory**
 

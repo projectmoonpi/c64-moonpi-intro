@@ -7,7 +7,7 @@
 ; =============================================================================================
 
 !cpu 6510
-!to "build/moonpi-intro.prg", cbm
+!to "build/moonpi-intro-lz.prg", cbm
 !source "build/pack.inc"
 
 src     = $fb
