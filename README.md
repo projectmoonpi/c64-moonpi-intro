@@ -5,7 +5,8 @@
 
 The animated Project Moon Pi logo intro from ProjectMoonPi.com, rebuilt for a real **NTSC Commodore 64**.
 It is built to show what the machine can do.
-It is one of the [Project Moon Pi Commodore projects](https://github.com/projectmoonpi/commodore).
+It is one of the [Project Moon Pi Commodore projects](https://github.com/projectmoonpi/commodore), and it has a page in
+the [8-Bit Corner at projectmoonpi.com](https://projectmoonpi.com/8-bit-corner/), with a video of it running.
 
 <p align="center"><img src="docs/img/screenshot-c64.png" width="576" alt="The intro running in VICE (NTSC)"></p>
 
